@@ -1,245 +1,360 @@
 #!/usr/bin/env bash
 set -e
-#set -x
+# set -x
 
-REMOTEFORWARDP=${REMOTEFORWARDP:-"2220"}
-REMOTEADDR=${REMOTEADDR:-"example.com"}
-REMOTEPORT=${REMOTEPORT:-"22"}
-REMOTEUSER=${REMOTEUSER:-"remoteuser"}
-LOCALPORT=${LOCALPORT:-"22"}
-OSIMAGE=${OSIMAGE:-"/usr/src/2023-05-03-raspios-bullseye-arm64-lite.img"}
-ROOTMOUNT=${ROOTMOUNT:-"/mnt/cryptroot"}
-ROOTIMAGE=${ROOTIMAGE:-"/dev/loop0p2"}
-BOOTIMAGE=${BOOTIMAGE:-"/dev/loop0p1"}
-CRYPTMAP=${CRYPTMAP:-"crypt"}
-SERVERPUBKEY=${SERVERPUBKEY:-"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI.... remote@example.com"}
-USERPUBKEY=${USERPUBKEY:-"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI.... user@example.local"}
+usage () {
+  if [ "$#" -eq "0" ]; then
+    usage mountimage cryptloop umountall writeimage cryptunlock chrootmount bootconfig fstabconfig dbinitramfs initramfs installinitramfs updateinitramfs firstrun
+    return 0
+  fi
+  echo "Usage: "
+  for arg in "$@"; do
+    case "$arg" in
+      mountimage)
+        echo "  $0 mountimage OSIMAGE"
+        ;;
+      cryptloop)
+        echo "  $0 cryptloop OSIMAGE EXTENDSIZE KEYFILE CRYPTPASS CRYPTMAP"
+        ;;
+      writeimage)
+        echo "  $0 writeimage OSIMAGE DEVICESD"
+        ;;
+      cryptunlock)
+        echo "  $0 cryptunlock cryptimg cryptmapper"
+        ;;
+      chrootmount)
+        echo "  $0 chrootmount bootimg rootimg mntpath [cryptmapper] [keyfile]"
+        ;;
+      installinitramfs)
+        echo "  $0 installinitramfs mntpath dbpubkeyexportpath"
+        ;;
+      dbinitramfs)
+        echo "  $0 dbinitramfs mntpath SERVERPUBKEY USERPUBKEY"
+        ;;
+      bootconfig)
+        echo "  $0 bootconfig mntpath cryptmap"
+        ;;
+      fstabconfig)
+        echo "  $0 fstabconfig mntpath cryptmap"
+        ;;
+      initramfs)
+        echo "  $0 initramfs mntpath cryptremotepath"
+        ;;
+      updateinitramfs)
+        echo "  $0 updateinitramfs mntpath"
+        ;;
+      firstrun)
+        echo "  $0 firstrun mntpath firstrunpath"
+        ;;
+      umountall)
+        echo "  $0 umountall mntpath"
+        ;;
+    esac
+  done
+  }
 
-mountimage(){
-    existing_loop=$(losetup -j ${OSIMAGE})
-    if [ -z ${existing_loop} ]; then
-        loop=$(losetup -f)
-        losetup -Pf ${OSIMAGE}
-    fi
-    ROOTIMAGE="${loop}p2"
-    BOOTIMAGE="${loop}p1"
+# get_label IMG
+get_label() {
+    isblkid=$(blkid $1) || return 1
+    echo $(echo $isblkid | sed 's/.*LABEL="\(\w*\)".*/\1/')
 }
 
+fstype() {
+    isblkid=$(blkid $1) || return 1
+    echo $(echo $isblkid | sed 's/.*TYPE="\(\w*\)".*/\1/')
+}
 
-cryptloop(){
-    existing_loop=$(losetup -j ${OSIMAGE})
-    if [ -z ${existing_loop} ]; then
-        loop=$(losetup -f)
-        losetup -Pfr ${OSIMAGE}
+get_directory(){
+    if [ -d "$1" ];then
+        return 0
+    else
+        echo "Invalid Directory: $1"
+        return 1
     fi
-    ROOTIMAGE="${loop}p2"
-    BOOTIMAGE="${loop}p1"
-    losetup -Pfr ${OSIMAGE}
-    #fdisk -l  /dev/loop0
+}
+
+get_file(){
+    if [ -f "$1" ];then
+        return 0
+    else
+        echo "Invalid File: $1"
+        return 1
+    fi
+}
+
+fstypecheck(){
+    fstypeimg=$(fstype $1) || return 1
+    [[ fstypeimg=="$2" ]] && echo $1
+}
+
+# inputs: OSIMAGE
+# outputs: loopimages
+mountimage(){
+    loop=$(losetup -l -n -O name -j $1)
+    if test -z ${loop} ; then
+        loop=$(losetup -f)
+        losetup -Pf ${1}
+    fi
+    for p in ${loop}p*; do
+        echo $p
+    done
+}
+
+# cryptloop OSIMAGE IMGEXTENDSIZE KEYFILE CRYPTPASS CRYPTMAP
+cryptloop(){
+    OSIMAGE=$1
+    IMGEXTENDSIZE=$2
+    KEYFILE=$3
+    CRYPTPASS=$4
+    CRYPTMAP=${5:-"cryptmap0"}
+    ROOTIMAGE=""
+    mountimage $OSIMAGE
+    for p in $(mountimage $1); do
+        blkid -t TYPE=ext4 $p && ROOTIMAGE=$p
+    done
     imgsize=$(partx ${OSIMAGE} -o SIZE -brg -n2)
-    extendsize=$((${imgsize}+256*1024*1024))
-    osimagedir=$(dirname ${OSIMAGE})
-    dd if=${ROOTIMAGE} of=${osimagedir}/rootfs.img status=progress
+    extendsize=$((${IMGEXTENDSIZE}*1024*1024)) 
+    newsize=$((${imgsize}+${extendsize}))
+    cloneroot=$(dirname $OSIMAGE)/$(basename "${OSIMAGE%.*}")-$(blkid -p --match-tag LABEL --output value $ROOTIMAGE).img
+    dd if=${ROOTIMAGE} of=$cloneroot status=progress
     losetup -D
     parted ${OSIMAGE} rm 2
-    truncate -s ${extendsize} 
-    parted -a minimal ${OSIMAGE} mkpart primary 0% 100%
-    loop=$(losetup -f)
-    losetup -Pf ${OSIMAGE}
-    ROOTIMAGE="${loop}p2"
-    BOOTIMAGE="${loop}p1"
-    cryptsetup -v -y --pbkdf pbkdf2 --cipher aes-cbc-essiv:sha256 --key-size 256 luksFormat ${ROOTIMAGE}
-    cryptsetup luksOpen ${ROOTIMAGE} ${CRYPTMAP}
-    dd if="${osimagedir}/rootfs.img" of=/dev/mapper/${CRYPTMAP} status=progress
+    truncate -s +${extendsize} ${OSIMAGE}
+    endsector=$(partx ${OSIMAGE} -o END -rg -n1)
+    startsector=$((${endsector}+1))
+    parted -a minimal -s ${OSIMAGE} mkpart primary ${startsector}s 100%
+    mountimage $OSIMAGE
+    test -e ${KEYFILE} || dd bs=512 count=4 if=/dev/random of=${KEYFILE} iflag=fullblock && chmod -v 0400 ${KEYFILE} && chown root:root ${KEYFILE}
+    cryptsetup -q -v -y --pbkdf pbkdf2 --cipher aes-cbc-essiv:sha256 --key-size 256 luksFormat ${ROOTIMAGE} ${KEYFILE}
+    echo -n ${CRYPTPASS} | cryptsetup -q -v luksAddKey --key-file=${KEYFILE} ${ROOTIMAGE}
+    test -e /dev/mapper/${CRYPTMAP} || cryptsetup luksOpen ${ROOTIMAGE} ${CRYPTMAP} --key-file ${KEYFILE}
+    dd if=$cloneroot of=/dev/mapper/${CRYPTMAP} status=progress
+    resize2fs /dev/mapper/${CRYPTMAP}
 }
 
+# umountall mntpath
+umountall() {
+    if mntsrc=$(findmnt -n -o SOURCE $1 ); then
+        echo "Mount source : $mntsrc"
+        umount -R $1
+        if [ "$(dirname $mntsrc)" = "/dev/mapper" ]; then
+            cryptsrc=$(cryptsetup status $mntsrc | grep device: | awk '{print $2}')
+            cryptsetup luksClose $mntsrc
+            echo "Luks close : $mntsrc"
+            mntsrc=$cryptsrc
+        fi
 
-mountcrypt() {
-    test -e ${ROOTIMAGE} || mount_img
-    cryptsetup -v luksOpen ${ROOTIMAGE} ${CRYPTMAP}
-    test -e ${ROOTMOUNT} || mkdir -v -p ${ROOTMOUNT}
-    mount /dev/mapper/${CRYPTMAP} ${ROOTMOUNT}
-    mount ${BOOTIMAGE} ${ROOTMOUNT}/boot/
-    mount -t proc none ${ROOTMOUNT}/proc
-    mount -t sysfs none ${ROOTMOUNT}/sys
-    mount -o bind /dev ${ROOTMOUNT}/dev
-    mount -o bind /dev/pts ${ROOTMOUNT}/dev/pts
+        if backfile=$(losetup -n -a -O BACK-FILE $mntsrc); then
+            losetup -d $(losetup -n -a -O NAME $mntsrc)
+            echo "$mntsrc detached from $backfile"
+        else
+            echo " Umount $1 Successfully."
+        fi
+    else
+        echo "Mount not found."
+    fi
 }
 
+# writeimage OSIMAGE DEVICESD
+writeimage() {
+    if ! get_file $1; then return 1; fi
+    DEVICESD=$2
+    loop=$(losetup -l -n -O name -j $1)
+    if [ -n "$loop" ];then
+        for i in $loop"p"*;do
+            if cryptsetup isLuks $i; then
+                uuid=$(blkid --match-tag UUID --output value /dev/loop0p2 | tr -d -)
+                if cryptmap=$(find  /dev/disk/by-id/ -iname "dm-uuid*$uuid*") && -n "$cryptmap"; then
+                    test targetmnt=$(findmnt -n -o TARGET $cryptmap) && umount -R $targetmnt
+                    cryptsetup luksClose $cryptmap
+                fi
+            fi
+        done
+        losetup -d $loop
+    fi
+    umountall $2
 
-setoption(){
-    option=${1//\//\\/}
-    value=${2//\//\\/}
-    seperator=$3
-    destfile=$4
-    sed -Ei \
-        -e "/${option}/{s/^(.*)(${option}[[:blank:]]*${seperator})([[:blank:]]*[^[:blank:]]*)(.*)/\1\2${value}\4/;q}" \
-        -e "s/(.*)$/\1 ${option}${seperator}${value} /" ${destfile}
+    dd bs=1M if="$1" of=$2 status=progress conv=fsync
 }
 
-
-bootconfig(){
-    set_option "root" "/dev/mapper/${CRYPTMAP}" "=" "${ROOTMOUNT}/boot/cmdline.txt"
-    set_option "cryptdevice" "UUID=${CRYPTUUID}:${CRYPTMAP}" "=" "${ROOTMOUNT}/boot/cmdline.txt"
-    cat "${ROOTMOUNT}/boot/cmdline.txt"
-    
-    bootconf="initramfs initramfs.gz followkernel"
-    grep -q "${bootconf}" ${ROOTMOUNT}/boot/config.txt || echo ${bootconf} >> ${ROOTMOUNT}/boot/config.txt
-    cat "${ROOTMOUNT}/boot/config.txt"
+# cryptunlock cryptimg cryptmapper
+cryptunlock() {
+    cryptimg=$1
+    cryptmapper=${2:-"cryptmap0"}
+    if test -e /dev/mapper/$cryptmapper; then
+        if testmount=$(findmnt /dev/mapper/$cryptmapper -o target -n); then umount -d -R $testmount;fi 
+        cryptsetup luksClose $cryptmapper
+    fi
+    test -v 3 && cryptsetup -q luksOpen $cryptimg $cryptmapper --key-file $3 || cryptsetup luksOpen $cryptimg $cryptmapper
+    test -b /dev/mapper/$cryptmapper && echo /dev/mapper/$cryptmapper || exit 2
 }
 
-
-fstabconfig(){
-    cp ${ROOTMOUNT}/etc/fstab ./fstab_backup
-    echo -e 'proc\t /proc\t proc\t defaults\t 0\t 0' > ${ROOTMOUNT}/etc/fstab
-    echo -e '/dev/mapper/'${CRYPTMAP}'\t /\t ext4\t errors=remount-ro\t 0\t 1' >> ${ROOTMOUNT}/etc/fstab
-    # echo -e 'UUID='${EXT4UUID}'\t /\t ext4\t errors=remount-ro\t 0\t 1' >> ${ROOTMOUNT}/etc/fstab
-    echo -e 'UUID='${BOOTUUID}'\t /boot\t vfat\t defaults\t 0\t 2' >> ${ROOTMOUNT}/etc/fstab
-    cat ${ROOTMOUNT}/etc/fstab
-    echo -e ${CRYPTMAP}'\t UUID='${CRYPTUUID}'\t none\t luks' > ${ROOTMOUNT}/etc/crypttab
-    cat ${ROOTMOUNT}/etc/crypttab
-}
-
-
-dbinitramfs(){
-    test -e ${ROOTMOUNT}/etc/dropbear-initramfs || mkdir -pv ${ROOTMOUNT}/etc/dropbear-initramfs/ 
-    test -e ${ROOTMOUNT}/etc/dropbear-initramfs/authorized_keys || touch ${ROOTMOUNT}/etc/dropbear-initramfs/authorized_keys
-    chmod 600 ${ROOTMOUNT}/etc/dropbear-initramfs/authorized_keys
-    echo ${SERVERPUBKEY} > ${ROOTMOUNT}/etc/dropbear-initramfs/authorized_keys
-    echo 'command="/etc/unluks.sh; exit" '${USERPUBKEY} >> ${ROOTMOUNT}/etc/dropbear-initramfs/authorized_keys
-    cat ${ROOTMOUNT}/etc/dropbear-initramfs/authorized_keys
-}
-
-
-
-initramfs(){
-cat << _EOF_ > ${ROOTMOUNT}/etc/initramfs-tools/hooks/zz-cryptsetup 
-#!/bin/sh
-set -e
-
-PREREQ=""
-prereqs()
-{
-	echo "\${PREREQ}"
-}
-
-case "\${1}" in
-	prereqs)
-		prereqs
-		exit 0
-		;;
-esac
-
-. /usr/share/initramfs-tools/hook-functions
-
-mkdir -p \${DESTDIR}/cryptroot || true
-cat /etc/crypttab >> \${DESTDIR}/cryptroot/crypttab
-cat /etc/fstab >> \${DESTDIR}/cryptroot/fstab
-cat /etc/crypttab >> \${DESTDIR}/etc/crypttab
-cat /etc/fstab >> \${DESTDIR}/etc/fstab
-
-_EOF_
-
-chmod +x ${ROOTMOUNT}/etc/initramfs-tools/hooks/zz-cryptsetup
-
-grep -q dm_crypt ${ROOTMOUNT}/etc/initramfs-tools/modules || echo dm_crypt >> ${ROOTMOUNT}/etc/initramfs-tools/modules
-
-echo CRYPTSETUP=y >> ${ROOTMOUNT}/etc/cryptsetup-initramfs/conf-hook
-
-cat << _EOF_ > ${ROOTMOUNT}/etc/initramfs-tools/unluks.sh
-#!/bin/sh
-
-export PATH='/sbin:/bin:/usr/sbin:/usr/bin'
-
-if [ \${1+1} ]; then
-    echo -e \$1'\n' | cryptsetup luksOpen /dev/disk/by-uuid/${CRYPTUUID} crypt
-else
-    while true; do
-        test -e /dev/mapper/${CRYPTMAP} && break
-        cryptsetup luksOpen /dev/disk/by-uuid/${CRYPTUUID} crypt
-        [ \$? -eq 0 ] && sleep 2 || exit 1
+dosimg() {
+    loop=$(losetup -l -n -O name -j $1 | head -n 1)
+    if test -z ${loop} ; then
+        loop=$(losetup -f)
+        losetup -Pf $1
+    fi
+    for p in ${loop}p*; do
+        echo $p
     done
-fi
-
-if test -e /dev/mapper/${CRYPTMAP}; then
-    /scripts/local-top/cryptroot
-    for i in \$(ps aux | grep 'cryptroot' | grep -v 'grep' | awk '{print \$1}'); do kill -9 \$i; done
-    for i in \$(ps aux | grep 'askpass' | grep -v 'grep' | awk '{print \$1}'); do kill -9 \$i; done
-    for i in \$(ps aux | grep 'ask-for-password' | grep -v 'grep' | awk '{print \$1}'); do kill -9 \$i; done
-    for i in \$(ps aux | grep 'dbclient' | grep -v 'grep' | awk '{print \$1}'); do kill -9 \$i; done
-    for i in \$(ps aux | grep 'authback' | grep -v 'grep' | awk '{print \$1}'); do kill -9 \$i; done
-    for i in \$(ps aux | grep '\\-sh' | grep -v 'grep' | awk '{print \$1}'); do kill -9 \$i; done
-    exit 0
-fi
-exit 1
-
-_EOF_
-
-chmod +x ${ROOTMOUNT}/etc/initramfs-tools/unluks.sh
-
-cat << _EOF_ > ${ROOTMOUNT}/etc/initramfs-tools/scripts/init-premount/authback
-#!/bin/sh
-
-PREREQ="dropbear"
-prereqs()
-{
-	echo "\${PREREQ}"
-}
- 
-case "\${1}" in
-	prereqs)
-		prereqs
-		exit 0
-		;;
-esac
-
-. /scripts/functions
-
-check_internet(){
-	if ping -c 1 google.com > /dev/null 2>&1; then
-	    echo "online"
-	else
-	    echo "offline"
-	fi
 }
 
-create_link(){
-	echo "LINK UP: Waiting for the network config"
-	while :; do
-		if [[ \$(check_internet) == "online" ]]; then 
-			break
-		fi
-		sleep 2 || exit
-	done
-	echo "Creating link with server..."
-	/sbin/ifconfig lo up
-	dbclient -R ${REMOTEFORWARDP}:127.0.0.1:${LOCALPORT} ${REMOTEUSER}@${REMOTEADDR} -p ${REMOTEPORT} -i /root/.ssh/dropbear_ed25519_host_key -y -T 
+gptimg() {
+    for p in ${1}*; do
+        echo $p
+    done
 }
 
-watchdog(){
-	echo "Watchdog started for network config"
-	sleep 60
-
-	if [[ \$(check_internet) == "online" ]]; then
-		echo "Internet connection OK: stopping the short watchdog,"
-		echo "...setting long watchdog (10 minutes)."
-		sleep 600
-	else
-		echo "No internet connection, rebooting..."
-		sleep 3
-	fi
-	test -e /dev/mapper/${CRYPTMAP} && exit 0 || /sbin/reboot -f || exit
+# rootcheck rootimg cryptmapper
+rootcheck() {
+    fstyperootimg=$(fstype $1) || return 1
+    case $fstyperootimg in
+        gpt)
+            for i in $(gptimg $1); do
+                sleep 1
+                rootcheck $i $2 $3
+            done
+        ;;
+        dos)
+            for i in $(dosimg $1); do
+                sleep 1
+                rootcheck $i $2 $3
+            done
+        ;;
+        ext4)
+            echo $1
+        ;;
+        crypto_LUKS)
+            unlockedimg=$(cryptunlock $1 $2 $3)
+            echo $unlockedimg
+        ;;
+    esac
 }
 
-create_link &
-watchdog &
+# bootcheck bootimg
+bootcheck() {
+    fstypebootimg=$(fstype $1) || return 1
+    case $fstypebootimg in
+        "gpt")
+            for i in $(gptimg $1); do
+                sleep 1
+                bootcheck $i
+            done
+        ;;
+        "dos")
+            for i in $(dosimg $1); do
+                sleep 1
+                bootcheck $i
+            done
+        ;;
+        "vfat")
+            echo $1
+        ;;
+    esac
+}
 
-_EOF_
+get_bootpath(){
+    test -z "$1" && return 1
+    local bootpath=$(sed -rn '/boot/s/^(\S*)\s*([a-zA-Z\/]*)\s*(\w*)\s.*/\2/p' $1/etc/fstab)
+    if [ -n "$bootpath" ]; then
+        echo $bootpath
+    else
+        return 1
+    fi
+}
 
-chmod +x ${ROOTMOUNT}/etc/initramfs-tools/scripts/init-premount/authback
+# chrootmount bootimg rootimg mntpoint [cryptmapper] [keyfile]
+chrootmount() {
+    if ! get_file $1; then return 1; fi
+    if ! get_file $2; then return 1; fi
+    if ! get_directory $3; then return 1; fi
+
+    bootimgcheck=$(bootcheck $1)
+    rootimgcheck=$(rootcheck $2 $4 $5)
+    if  [[ -n bootimgcheck && -v rootimgcheck ]]; then
+        test -e ${3} || mkdir -v -p ${3}
+        findmnt -R ${3} && umount -d -R ${3}
+        findmnt ${3} || mount $rootimgcheck ${3}
+        local bootpath=${3}$(get_bootpath ${3})
+        findmnt $bootpath || mount $bootimgcheck $bootpath
+        findmnt ${3}/proc || mount -t proc none ${3}/proc
+        findmnt ${3}/sys || mount -t sysfs none ${3}/sys
+        findmnt ${3}/dev || mount -o bind /dev ${3}/dev
+        findmnt ${3}/dev/pts || mount -o bind /dev/pts ${3}/dev/pts
+    fi
+}
+
+# bootconfig mntpath cryptmap
+bootconfig(){
+    cryptdev=$(cryptsetup status $2 | sed -rn '/device:/s/.*device:\s*(\S*).*/\1/p')
+    cryptuuid=$(blkid --match-tag UUID --output value $cryptdev)
+    luksUUID
+    # if [ -z ${ROOTIMAGE} ]; then mountimage; fi
+    test -z $1 && return 1
+    local bootpath=$1$(get_bootpath $1)
+    sed -i -E "s/(.*root=)(\S*)(\s.*)/\1\/dev\/mapper\/$2 cryptdevice=UUID=$cryptuuid:$2\3/" $bootpath/cmdline.txt
+    cat $bootpath/cmdline.txt
+}
+
+# fstabconfig mntpath cryptmap
+fstabconfig(){
+    test -z "$1" && return 1
+    cryptdev=$(cryptsetup status $2 | sed -rn '/device:/s/.*device:\s*(\S*).*/\1/p')
+    cryptuuid=$(blkid --match-tag UUID --output value $cryptdev)
+    bootdev=$(findmnt "$1$(get_bootpath $1)" | sed -nr '2s/\S*\s*(\S*).*/\1/p')
+    bootuuid=$(blkid --match-tag UUID --output value $bootdev)
+    cp ${1}/etc/fstab ./fstab_backup
+    sed -i -r -e "/boot/s/^\S*(\s*.*)/UUID=$bootuuid\1/" -e "/\s\/\s/s/^\S*(\s*.*)/\/dev\/mapper\/$2\1/" ${1}/etc/fstab
+    cat ${1}/etc/fstab
+    echo -e ${2}'\t UUID='$cryptuuid'\t none\t luks' > ${1}/etc/crypttab
+    cat ${1}/etc/crypttab
+}
+
+# dbinitramfs rootfolder SERVERPUBKEY USERPUBKEY
+dbinitramfs(){
+    if (( $# < 2 )); then
+        echo "usage dbinitramfs rootfolder SERVERPUBKEY USERPUBKEY"
+        return 1
+    fi
+    if [[ -d $1 ]]; then
+    test -e $1/etc/dropbear/initramfs || mkdir -pv $1/etc/dropbear/initramfs/
+    test -e $1/etc/dropbear/initramfs/authorized_keys || touch $1/etc/dropbear/initramfs/authorized_keys
+    chmod 600 $1/etc/dropbear/initramfs/authorized_keys
+    echo $2 > $1/etc/dropbear/initramfs/authorized_keys
+    echo $3 >> $1/etc/dropbear/initramfs/authorized_keys
+    cat $1/etc/dropbear/initramfs/authorized_keys
+    else 
+        echo "Invalid Directory: $1"
+        return 1
+    fi
+}
+
+# installinitramfs ROOTMOUNT dbpubkeyexportpath
+installinitramfs() {
+    ROOTMOUNT=${1:-"${ROOTMOUNT}"}
+    dbpubkeyexportpath=${2:-$dbpubkeyexportpath}
+    env LANG=C chroot ${ROOTMOUNT} apt update 
+    env LANG=C chroot ${ROOTMOUNT} apt upgrade -y
+    env LANG=C chroot ${ROOTMOUNT} apt install -y busybox cryptsetup dropbear-initramfs cryptsetup-initramfs
+    env LANG=C chroot ${ROOTMOUNT} dropbearkey -y -f /etc/dropbear/initramfs/dropbear_ed25519_host_key | grep "^ssh-ed25519 " > $dbpubkeyexportpath
+    cp ${ROOTMOUNT}/etc/dropbear/initramfs/*key ./
+}
 
 
-cat << _EOF_ > ${ROOTMOUNT}/etc/initramfs-tools/hooks/zz-dbclient
+# ./cryptremote.sh initramfs /mnt/chroot1 ./authbach
+# initramfs ROOTMOUNT cryptremotepath
+initramfs(){
+test -z "$1" && return 1
+test -z "$2" && return 1
+grep -q 'IP="dhcp"' $1/etc/initramfs-tools/initramfs.conf || echo 'IP="dhcp"' >> $1/etc/initramfs-tools/initramfs.conf
+grep -q 'dm_crypt' $1/etc/initramfs-tools/modules || echo dm_crypt >> $1/etc/initramfs-tools/modules
+grep -q 'CRYPTSETUP=y' $1/etc/cryptsetup-initramfs/conf-hook || echo CRYPTSETUP=y >> $1/etc/cryptsetup-initramfs/conf-hook
+
+cp -v $2 $1/etc/initramfs-tools/scripts/init-premount/cryptremote
+chmod +x $1/etc/initramfs-tools/scripts/init-premount/cryptremote
+
+cat << _EOF_ > $1/etc/initramfs-tools/hooks/zz-dbclient
 #!/bin/sh
 set -e
 
@@ -261,12 +376,8 @@ esac
 # Begin real processing below this line
 
 copy_exec /usr/bin/dbclient /bin
-SSH_DIR="\${DESTDIR}/root/.ssh/"
-mkdir -p \$SSH_DIR
-cp /etc/dropbear-initramfs/dropbear_ed25519_host_key \$SSH_DIR
 
-
-LIB=/lib/aarch64-linux-gnu
+LIB=/lib/\$(uname -m)-linux-gnu
 mkdir -p "\$DESTDIR/\$LIB"
 cp \$LIB/libnss_dns.so.2 \\
   \$LIB/libnss_files.so.2 \\
@@ -274,18 +385,46 @@ cp \$LIB/libnss_dns.so.2 \\
   \$LIB/libc.so.6 \\
   "\${DESTDIR}/\$LIB"
 echo nameserver 8.8.8.8 > "\${DESTDIR}/etc/resolv.conf"
-copy_file shell /etc/initramfs-tools/unluks.sh /etc/unluks.sh
-
 _EOF_
 
-chmod +x ${ROOTMOUNT}/etc/initramfs-tools/hooks/zz-dbclient
+chmod +x $1/etc/initramfs-tools/hooks/zz-dbclient
+}
 
-cp ${ROOTMOUNT}/usr/share/initramfs-tools/scripts/init-premount/dropbear \
-${ROOTMOUNT}/etc/initramfs-tools/scripts/init-premount/dropbear
+# firstrun mntpath firstrunpath
+firstrun(){
+    if ! get_directory $1; then return 1; fi
+    if ! get_file $2; then return 1; fi
+    bootpath=$1$(get_bootpath $1)
+    cp $2 $1/root/firstrun2.sh
+    chmod +x $1/root/firstrun2.sh
+    boot_option='systemd.run=\/root\/firstrun2.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target'
+    sed -i 's/ systemd.run.*//g' $bootpath/cmdline.txt
+    sed -i "/\(systemd.run=.*\s\)/q 0;s/\(.*\)/\1 $boot_option/" $bootpath/cmdline.txt
+    cat $bootpath/cmdline.txt
+}
 
-sed -i '/^.*!= nfs/a sleep 5' ${ROOTMOUNT}/etc/initramfs-tools/scripts/init-premount/dropbear
-
+# updateinitramfs mntpath
+updateinitramfs(){
+    env LANG=C chroot $1 update-initramfs -u 
 }
 
 
-${func} 
+if [ "$#" -eq 0 ]; then
+  echo "No command specified"
+  usage
+  exit 1
+fi
+
+command="$1"; shift
+case "$command" in
+  mountimage|cryptloop|umountall|writeimage|cryptunlock|chrootmount|bootconfig|fstabconfig|dbinitramfs|initramfs|installinitramfs|updateinitramfs|firstrun)
+    "$command" "$@"
+    ;;
+  *)
+    echo "Unsupported command: $command"
+    usage
+    exit 1
+    ;;
+esac
+
+
